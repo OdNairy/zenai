@@ -1,0 +1,973 @@
+#!/usr/bin/env python3
+"""ZenMoney CLI tool for managing transactions via API."""
+
+import argparse
+import json
+import os
+import sys
+import time
+import uuid
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+TOKEN_FILE = DATA_DIR / "token"
+RAW_FILE = DATA_DIR / "raw.json"
+STATE_FILE = DATA_DIR / "state.json"
+PENDING_FILE = DATA_DIR / "pending.json"
+
+API_URL = "https://api.zenmoney.ru/v8/diff/"
+
+
+def err(msg):
+    print(msg, file=sys.stderr)
+
+
+def die(msg):
+    err(f"error: {msg}")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# DataStore
+# ---------------------------------------------------------------------------
+
+class DataStore:
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    def read_token(self):
+        if not TOKEN_FILE.exists():
+            die(f"token file not found: {TOKEN_FILE}\nPut your ZenMoney API token there.")
+        return TOKEN_FILE.read_text().strip()
+
+    def read_raw(self):
+        if not RAW_FILE.exists():
+            return {}
+        return json.loads(RAW_FILE.read_text())
+
+    def write_raw(self, data):
+        RAW_FILE.write_text(json.dumps(data, ensure_ascii=False))
+
+    def read_state(self):
+        if not STATE_FILE.exists():
+            return {"serverTimestamp": 0}
+        return json.loads(STATE_FILE.read_text())
+
+    def write_state(self, state):
+        STATE_FILE.write_text(json.dumps(state))
+
+    def read_pending(self):
+        if not PENDING_FILE.exists():
+            return []
+        return json.loads(PENDING_FILE.read_text())
+
+    def write_pending(self, pending):
+        PENDING_FILE.write_text(json.dumps(pending, ensure_ascii=False))
+
+    def add_pending(self, action, entity, eid, old, new):
+        pending = self.read_pending()
+        seq = (pending[-1]["seq"] + 1) if pending else 1
+        pending.append({
+            "seq": seq,
+            "ts": int(time.time()),
+            "action": action,
+            "entity": entity,
+            "id": eid,
+            "old": old,
+            "new": new,
+        })
+        self.write_pending(pending)
+        return seq
+
+
+# ---------------------------------------------------------------------------
+# ApiClient
+# ---------------------------------------------------------------------------
+
+class ApiClient:
+    def __init__(self, token):
+        self.token = token
+
+    def diff(self, server_timestamp, force_fetch=None):
+        body = {"currentClientTimestamp": int(time.time()), "serverTimestamp": server_timestamp}
+        if force_fetch:
+            body["forceFetch"] = force_fetch
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            API_URL,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            die(f"API error {e.code}: {body}")
+        except urllib.error.URLError as e:
+            die(f"network error: {e.reason}")
+
+
+# ---------------------------------------------------------------------------
+# Lookup
+# ---------------------------------------------------------------------------
+
+class Lookup:
+    def __init__(self, raw):
+        self.raw = raw
+        self.accounts_by_id = {}
+        self.tags_by_id = {}
+        self.tags_by_name = {}
+        self.instruments_by_id = {}
+        self.merchants_by_id = {}
+        self._build()
+
+    def _build(self):
+        for a in self.raw.get("account", []):
+            self.accounts_by_id[a["id"]] = a
+        for t in self.raw.get("tag", []):
+            self.tags_by_id[t["id"]] = t
+            self.tags_by_name[t["title"].lower()] = t
+        for i in self.raw.get("instrument", []):
+            self.instruments_by_id[i["id"]] = i
+        for m in self.raw.get("merchant", []):
+            self.merchants_by_id[m["id"]] = m
+
+    def account_name(self, aid):
+        a = self.accounts_by_id.get(aid)
+        return a["title"] if a else aid
+
+    def account_currency(self, aid):
+        a = self.accounts_by_id.get(aid)
+        if not a:
+            return "?"
+        inst = self.instruments_by_id.get(a.get("instrument"))
+        return inst["shortTitle"] if inst else "?"
+
+    def tag_name(self, tid):
+        t = self.tags_by_id.get(tid)
+        return t["title"] if t else tid
+
+    def tag_names(self, tag_list):
+        if not tag_list:
+            return []
+        return [self.tag_name(t) for t in tag_list]
+
+    def instrument_symbol(self, iid):
+        inst = self.instruments_by_id.get(iid)
+        return inst["shortTitle"] if inst else "?"
+
+    def merchant_name(self, mid):
+        if not mid:
+            return None
+        m = self.merchants_by_id.get(mid)
+        return m["title"] if m else mid
+
+    def resolve_tag_name(self, name):
+        """Resolve a tag name (case-insensitive) to its UUID. Returns (uuid, title) or None."""
+        t = self.tags_by_name.get(name.lower())
+        if t:
+            return t["id"], t["title"]
+        # try partial match
+        matches = [(tid, tobj) for tid, tobj in self.tags_by_id.items()
+                    if name.lower() in tobj["title"].lower()]
+        if len(matches) == 1:
+            return matches[0][0], matches[0][1]["title"]
+        if len(matches) > 1:
+            names = [m[1]["title"] for m in matches]
+            die(f"ambiguous tag '{name}': {', '.join(names)}")
+        die(f"tag not found: '{name}'")
+
+
+# ---------------------------------------------------------------------------
+# Formatter
+# ---------------------------------------------------------------------------
+
+class Formatter:
+    def __init__(self, lookup):
+        self.lk = lookup
+
+    def tx_type(self, tx):
+        inc = tx.get("income", 0)
+        out = tx.get("outcome", 0)
+        if inc > 0 and out > 0:
+            return "transfer"
+        if inc > 0:
+            return "income"
+        return "expense"
+
+    def format_amount(self, tx):
+        ttype = self.tx_type(tx)
+        if ttype == "transfer":
+            out_cur = self.lk.account_currency(tx.get("outcomeAccount", ""))
+            in_cur = self.lk.account_currency(tx.get("incomeAccount", ""))
+            out_amt = tx.get("outcome", 0)
+            in_amt = tx.get("income", 0)
+            if out_cur == in_cur and abs(out_amt - in_amt) < 0.01:
+                return f"{out_amt:.2f} {out_cur}"
+            return f"{out_amt:.2f} {out_cur} → {in_amt:.2f} {in_cur}"
+        if ttype == "income":
+            cur = self.lk.account_currency(tx.get("incomeAccount", ""))
+            return f"+{tx.get('income', 0):.2f} {cur}"
+        cur = self.lk.account_currency(tx.get("outcomeAccount", ""))
+        return f"-{tx.get('outcome', 0):.2f} {cur}"
+
+    def format_short(self, tx, is_pending=False):
+        ttype = self.tx_type(tx)
+        obj = {
+            "id": tx["id"][:8],
+            "date": tx.get("date", ""),
+            "type": ttype,
+            "amount": self.format_amount(tx),
+        }
+        if ttype == "transfer":
+            obj["from"] = self.lk.account_name(tx.get("outcomeAccount", ""))
+            obj["to"] = self.lk.account_name(tx.get("incomeAccount", ""))
+        else:
+            acct = tx.get("incomeAccount") if ttype == "income" else tx.get("outcomeAccount")
+            obj["account"] = self.lk.account_name(acct or "")
+        obj["payee"] = tx.get("payee") or tx.get("originalPayee") or self.lk.merchant_name(tx.get("merchant")) or None
+        obj["tags"] = self.lk.tag_names(tx.get("tag"))
+        obj["comment"] = tx.get("comment")
+        if is_pending:
+            obj["pending"] = True
+        return obj
+
+    def format_full(self, tx, is_pending=False):
+        obj = self.format_short(tx, is_pending)
+        obj["id"] = tx["id"]  # full id for show
+        obj["income"] = tx.get("income", 0)
+        obj["outcome"] = tx.get("outcome", 0)
+        obj["incomeAccount"] = tx.get("incomeAccount")
+        obj["outcomeAccount"] = tx.get("outcomeAccount")
+        obj["incomeInstrument"] = tx.get("incomeInstrument")
+        obj["outcomeInstrument"] = tx.get("outcomeInstrument")
+        if tx.get("opIncome"):
+            obj["opIncome"] = tx["opIncome"]
+        if tx.get("opOutcome"):
+            obj["opOutcome"] = tx["opOutcome"]
+        if tx.get("opIncomeInstrument"):
+            obj["opIncomeInstrument"] = tx["opIncomeInstrument"]
+            obj["opIncomeCurrency"] = self.lk.instrument_symbol(tx["opIncomeInstrument"])
+        if tx.get("opOutcomeInstrument"):
+            obj["opOutcomeInstrument"] = tx["opOutcomeInstrument"]
+            obj["opOutcomeCurrency"] = self.lk.instrument_symbol(tx["opOutcomeInstrument"])
+        obj["merchant"] = self.lk.merchant_name(tx.get("merchant"))
+        obj["originalPayee"] = tx.get("originalPayee")
+        obj["hold"] = tx.get("hold")
+        obj["created"] = self._ts(tx.get("created"))
+        obj["changed"] = self._ts(tx.get("changed"))
+        return obj
+
+    def format_account(self, acc):
+        inst = self.lk.instruments_by_id.get(acc.get("instrument"))
+        cur = inst["shortTitle"] if inst else "?"
+        return {
+            "id": acc["id"][:8],
+            "title": acc["title"],
+            "type": acc.get("type"),
+            "currency": cur,
+            "balance": acc.get("balance", 0),
+            "archived": acc.get("archive", False),
+        }
+
+    def format_tag(self, tag, flat=False):
+        obj = {
+            "id": tag["id"][:8],
+            "title": tag["title"],
+        }
+        if tag.get("parent") and not flat:
+            obj["parent"] = self.lk.tag_name(tag["parent"])
+        if tag.get("icon"):
+            obj["icon"] = tag["icon"]
+        return obj
+
+    def _ts(self, ts):
+        if not ts:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Resolve IDs
+# ---------------------------------------------------------------------------
+
+def resolve_id(transactions, prefix):
+    """Resolve a UUID prefix (min 4 chars) to a full transaction."""
+    if len(prefix) < 4:
+        die(f"ID prefix too short (min 4 chars): {prefix}")
+    matches = [tx for tx in transactions if tx["id"].startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) == 0:
+        die(f"no transaction matching prefix: {prefix}")
+    ids = [f"  {m['id'][:12]}  {m.get('date','')}  {m.get('payee','')}" for m in matches[:10]]
+    die(f"ambiguous prefix '{prefix}', matches:\n" + "\n".join(ids))
+
+
+def resolve_ids(transactions, prefixes):
+    return [resolve_id(transactions, p) for p in prefixes]
+
+
+# ---------------------------------------------------------------------------
+# Apply pending overlay
+# ---------------------------------------------------------------------------
+
+def apply_pending_overlay(raw, pending):
+    """Return transactions with pending mutations overlaid."""
+    if not pending:
+        return raw.get("transaction", []), set()
+    tx_map = {tx["id"]: dict(tx) for tx in raw.get("transaction", [])}
+    pending_ids = set()
+    for mut in pending:
+        if mut["entity"] != "transaction":
+            continue
+        tid = mut["id"]
+        pending_ids.add(tid)
+        if tid in tx_map:
+            tx_map[tid].update(mut["new"])
+        # note: we don't handle "create" action yet — only updates
+    return list(tx_map.values()), pending_ids
+
+
+# ---------------------------------------------------------------------------
+# Filter helpers
+# ---------------------------------------------------------------------------
+
+def filter_transactions(txs, args, pending_ids=None):
+    results = []
+    for tx in txs:
+        if tx.get("deleted"):
+            continue
+        if hasattr(args, 'from_date') and args.from_date and tx.get("date", "") < args.from_date:
+            continue
+        if hasattr(args, 'to_date') and args.to_date and tx.get("date", "") > args.to_date:
+            continue
+        if hasattr(args, 'payee') and args.payee:
+            p = (tx.get("payee") or tx.get("originalPayee") or "").lower()
+            if args.payee.lower() not in p:
+                continue
+        if hasattr(args, 'account') and args.account:
+            acct_match = False
+            for field in ("incomeAccount", "outcomeAccount"):
+                aid = tx.get(field)
+                if aid:
+                    # match by name prefix
+                    acct = lookup_global.accounts_by_id.get(aid)
+                    if acct and args.account.lower() in acct["title"].lower():
+                        acct_match = True
+                        break
+            if not acct_match:
+                continue
+        if hasattr(args, 'type') and args.type:
+            ttype = "transfer" if tx.get("income", 0) > 0 and tx.get("outcome", 0) > 0 else \
+                    "income" if tx.get("income", 0) > 0 else "expense"
+            if args.type != ttype:
+                continue
+        if hasattr(args, 'untagged') and args.untagged:
+            if tx.get("tag"):
+                continue
+        if hasattr(args, 'tag_filter') and args.tag_filter:
+            tx_tags = tx.get("tag") or []
+            tag_names_lower = [lookup_global.tag_name(t).lower() for t in tx_tags]
+            if not any(args.tag_filter.lower() in n for n in tag_names_lower):
+                continue
+        if hasattr(args, 'min_amount') and args.min_amount is not None:
+            amt = max(tx.get("income", 0), tx.get("outcome", 0))
+            if amt < args.min_amount:
+                continue
+        if hasattr(args, 'max_amount') and args.max_amount is not None:
+            amt = max(tx.get("income", 0), tx.get("outcome", 0))
+            if amt > args.max_amount:
+                continue
+        results.append(tx)
+    # sort by date descending
+    results.sort(key=lambda t: t.get("date", ""), reverse=True)
+    limit = getattr(args, 'limit', None)
+    if limit:
+        results = results[:limit]
+    return results
+
+
+# Global lookup for filter helper
+lookup_global = None
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_sync(args, store):
+    token = store.read_token()
+    client = ApiClient(token)
+    state = store.read_state()
+
+    if args.full:
+        err("full sync: fetching all data...")
+        state["serverTimestamp"] = 0
+    else:
+        err("incremental sync...")
+
+    resp = client.diff(state["serverTimestamp"])
+    new_ts = resp.get("serverTimestamp", state["serverTimestamp"])
+
+    # merge response into raw
+    raw = store.read_raw() if not args.full else {}
+    counts = {}
+    for entity, items in resp.items():
+        if not isinstance(items, list) or not items:
+            continue
+        if "id" in items[0]:
+            existing = {x["id"]: x for x in raw.get(entity, [])}
+            for item in items:
+                existing[item["id"]] = item
+            raw[entity] = list(existing.values())
+        else:
+            # entities without id (e.g. budget) — replace wholesale
+            raw[entity] = items
+        counts[entity] = len(items)
+
+    store.write_raw(raw)
+    store.write_state({"serverTimestamp": new_ts})
+
+    for entity, count in counts.items():
+        err(f"  {entity}: {count} updated")
+    tx_count = len([t for t in raw.get("transaction", []) if not t.get("deleted")])
+    err(f"total active transactions: {tx_count}")
+    err("sync complete.")
+
+
+def cmd_list(args, store):
+    global lookup_global
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+    lookup_global = lk
+    fmt = Formatter(lk)
+
+    filtered = filter_transactions(txs, args, pending_ids)
+    result = [fmt.format_short(tx, tx["id"] in pending_ids) for tx in filtered]
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_show(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+    fmt = Formatter(lk)
+
+    tx = resolve_id(txs, args.id)
+    result = fmt.format_full(tx, tx["id"] in pending_ids)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_accounts(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    lk = Lookup(raw)
+    fmt = Formatter(lk)
+
+    accounts = raw.get("account", [])
+    if not args.all:
+        accounts = [a for a in accounts if not a.get("archive")]
+    accounts.sort(key=lambda a: a.get("title", ""))
+    result = [fmt.format_account(a) for a in accounts]
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_tags(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    lk = Lookup(raw)
+    fmt = Formatter(lk)
+
+    tags = [t for t in raw.get("tag", []) if not t.get("deleted", False)]
+    tags.sort(key=lambda t: t.get("title", ""))
+    result = [fmt.format_tag(t, flat=args.flat) for t in tags]
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_tag_create(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    lk = Lookup(raw)
+
+    # check if tag already exists
+    existing = lk.tags_by_name.get(args.title.lower())
+    if existing:
+        die(f"tag already exists: '{existing['title']}' ({existing['id'][:8]})")
+
+    # resolve parent if provided
+    parent_id = None
+    if args.parent:
+        parent_id, parent_title = lk.resolve_tag_name(args.parent)
+        err(f"parent: {parent_title} ({parent_id[:8]})")
+
+    # get user id from raw
+    users = raw.get("user", [])
+    user_id = users[0]["id"] if users else 0
+
+    tag_id = str(uuid.uuid4())
+    tag_obj = {
+        "id": tag_id,
+        "user": user_id,
+        "changed": int(time.time()),
+        "icon": args.icon,
+        "budgetIncome": False,
+        "budgetOutcome": True,
+        "required": False,
+        "archive": False,
+        "showIncome": False,
+        "showOutcome": True,
+        "color": None,
+        "picture": None,
+        "title": args.title,
+        "parent": parent_id,
+        "staticId": None,
+    }
+
+    store.add_pending("create", "tag", tag_id, {}, tag_obj)
+
+    # also add to raw locally so subsequent commands can reference it
+    raw.setdefault("tag", []).append(tag_obj)
+    store.write_raw(raw)
+
+    err(f"created tag: {args.title} ({tag_id[:8]})")
+    print(json.dumps({"id": tag_id[:8], "title": args.title, "parent": parent_id and lk.tag_name(parent_id)}, ensure_ascii=False, indent=2))
+
+
+def cmd_pending(args, store):
+    pending = store.read_pending()
+    if not pending:
+        err("no pending changes.")
+        print("[]")
+        return
+    print(json.dumps(pending, ensure_ascii=False, indent=2))
+
+
+def cmd_tag_set(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+
+    # resolve tags
+    tag_ids = []
+    for name in args.tags:
+        tid, title = lk.resolve_tag_name(name)
+        tag_ids.append(tid)
+        err(f"tag: {title} ({tid[:8]})")
+
+    new_tags = tag_ids if tag_ids else None
+
+    for prefix in args.ids:
+        tx = resolve_id(txs, prefix)
+        old_tags = tx.get("tag")
+        store.add_pending("update", "transaction", tx["id"], {"tag": old_tags}, {"tag": new_tags})
+        err(f"  {tx['id'][:8]}: tag set → {lk.tag_names(new_tags)}")
+
+
+def cmd_tag_add(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+
+    tag_ids = []
+    for name in args.tags:
+        tid, title = lk.resolve_tag_name(name)
+        tag_ids.append(tid)
+        err(f"tag: {title} ({tid[:8]})")
+
+    for prefix in args.ids:
+        tx = resolve_id(txs, prefix)
+        old_tags = tx.get("tag") or []
+        new_tags = list(set(old_tags + tag_ids))
+        store.add_pending("update", "transaction", tx["id"], {"tag": tx.get("tag")}, {"tag": new_tags})
+        err(f"  {tx['id'][:8]}: tags → {lk.tag_names(new_tags)}")
+
+
+def cmd_tag_remove(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+
+    remove_ids = []
+    for name in args.tags:
+        tid, title = lk.resolve_tag_name(name)
+        remove_ids.append(tid)
+        err(f"removing tag: {title}")
+
+    for prefix in args.ids:
+        tx = resolve_id(txs, prefix)
+        old_tags = tx.get("tag") or []
+        if remove_ids:
+            new_tags = [t for t in old_tags if t not in remove_ids]
+        else:
+            new_tags = None  # remove all
+        store.add_pending("update", "transaction", tx["id"], {"tag": tx.get("tag")}, {"tag": new_tags})
+        err(f"  {tx['id'][:8]}: tags → {lk.tag_names(new_tags)}")
+
+
+def cmd_edit(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+
+    tx = resolve_id(txs, args.id)
+    old = {}
+    new = {}
+
+    for assignment in args.fields:
+        if "=" not in assignment:
+            die(f"invalid field assignment: {assignment} (expected field=value)")
+        field, value = assignment.split("=", 1)
+        field = field.strip()
+        allowed = {"payee", "comment", "date", "outcome", "income"}
+        if field not in allowed:
+            die(f"cannot edit field '{field}'. Allowed: {', '.join(sorted(allowed))}")
+        if field in ("outcome", "income"):
+            value = float(value)
+        old[field] = tx.get(field)
+        new[field] = value
+
+    store.add_pending("update", "transaction", tx["id"], old, new)
+    err(f"edited {tx['id'][:8]}: {new}")
+
+
+def cmd_delete(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+
+    for prefix in args.ids:
+        tx = resolve_id(txs, prefix)
+        store.add_pending("update", "transaction", tx["id"], {"deleted": False}, {"deleted": True})
+        err(f"  deleted {tx['id'][:8]}")
+
+
+def cmd_merge(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+    fmt = Formatter(lk)
+
+    if len(args.ids) < 2:
+        die("merge requires at least 2 IDs")
+
+    resolved = resolve_ids(txs, args.ids)
+    target = resolved[0]
+    rest = resolved[1:]
+
+    total_income = target.get("income", 0)
+    total_outcome = target.get("outcome", 0)
+
+    for tx in rest:
+        total_income += tx.get("income", 0)
+        total_outcome += tx.get("outcome", 0)
+        store.add_pending("update", "transaction", tx["id"], {"deleted": False}, {"deleted": True})
+        err(f"  soft-deleted {tx['id'][:8]}")
+
+    old = {"income": target.get("income", 0), "outcome": target.get("outcome", 0)}
+    new = {"income": total_income, "outcome": total_outcome}
+    store.add_pending("update", "transaction", target["id"], old, new)
+    err(f"  merged into {target['id'][:8]}: income={total_income}, outcome={total_outcome}")
+
+
+def cmd_make_transfer(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+
+    expense = resolve_id(txs, args.expense_id)
+    income_tx = resolve_id(txs, args.income_id)
+
+    # validate types
+    if expense.get("income", 0) > 0 and expense.get("outcome", 0) > 0:
+        die(f"{expense['id'][:8]} is already a transfer")
+    if income_tx.get("income", 0) > 0 and income_tx.get("outcome", 0) > 0:
+        die(f"{income_tx['id'][:8]} is already a transfer")
+
+    # build the transfer from expense
+    old = {
+        "income": expense.get("income", 0),
+        "incomeAccount": expense.get("incomeAccount"),
+        "incomeInstrument": expense.get("incomeInstrument"),
+    }
+    new = {
+        "income": income_tx.get("income", 0),
+        "incomeAccount": income_tx.get("incomeAccount"),
+        "incomeInstrument": income_tx.get("incomeInstrument"),
+    }
+    store.add_pending("update", "transaction", expense["id"], old, new)
+    store.add_pending("update", "transaction", income_tx["id"], {"deleted": False}, {"deleted": True})
+
+    err(f"converted to transfer: {expense['id'][:8]}")
+    err(f"  outcome: {expense.get('outcome', 0)} from {lk.account_name(expense.get('outcomeAccount', ''))}")
+    err(f"  income: {income_tx.get('income', 0)} to {lk.account_name(income_tx.get('incomeAccount', ''))}")
+    err(f"soft-deleted: {income_tx['id'][:8]}")
+
+
+def cmd_undo(args, store):
+    pending = store.read_pending()
+    if not pending:
+        err("nothing to undo.")
+        return
+
+    if args.all:
+        store.write_pending([])
+        err(f"reverted all {len(pending)} pending changes.")
+    else:
+        removed = pending.pop()
+        store.write_pending(pending)
+        err(f"reverted: {removed['action']} {removed['entity']} {removed['id'][:8]}")
+
+
+def cmd_push(args, store):
+    raw = store.read_raw()
+    pending = store.read_pending()
+    if not pending:
+        err("nothing to push.")
+        return
+
+    # group mutations by (entity, id), merge fields
+    merged = {}
+    for mut in pending:
+        key = (mut["entity"], mut["id"])
+        if key not in merged:
+            merged[key] = {"old": {}, "new": {}}
+        merged[key]["old"].update(mut["old"])
+        merged[key]["new"].update(mut["new"])
+
+    # build diff payload
+    diff_payload = {}
+    for (entity, eid), changes in merged.items():
+        # find original in raw
+        originals = {x["id"]: x for x in raw.get(entity, [])}
+        base = dict(originals.get(eid, {"id": eid}))
+        base.update(changes["new"])
+        base["changed"] = int(time.time())
+        diff_payload.setdefault(entity, []).append(base)
+
+    if args.dry_run:
+        err("dry run — would push:")
+        for entity, items in diff_payload.items():
+            err(f"  {entity}: {len(items)} item(s)")
+        print(json.dumps(diff_payload, ensure_ascii=False, indent=2))
+        return
+
+    token = store.read_token()
+    client = ApiClient(token)
+    state = store.read_state()
+
+    # POST diff
+    body = {
+        "currentClientTimestamp": int(time.time()),
+        "serverTimestamp": state["serverTimestamp"],
+    }
+    body.update(diff_payload)
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        API_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        die(f"push failed: {e.code}: {body_text}")
+    except urllib.error.URLError as e:
+        die(f"push network error: {e.reason}")
+
+    # update raw with response
+    new_ts = result.get("serverTimestamp", state["serverTimestamp"])
+    entities = ["transaction", "account", "tag", "merchant", "instrument"]
+    for entity in entities:
+        items = result.get(entity, [])
+        if not items:
+            continue
+        existing = {x["id"]: x for x in raw.get(entity, [])}
+        for item in items:
+            existing[item["id"]] = item
+        raw[entity] = list(existing.values())
+
+    store.write_raw(raw)
+    store.write_state({"serverTimestamp": new_ts})
+    store.write_pending([])
+
+    pushed_count = sum(len(v) for v in diff_payload.values())
+    err(f"pushed {pushed_count} change(s). Pending cleared.")
+
+
+# ---------------------------------------------------------------------------
+# Argparse
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="zm", description="ZenMoney CLI")
+    sub = parser.add_subparsers(dest="command")
+
+    # sync
+    p = sub.add_parser("sync", help="Sync with ZenMoney API")
+    p.add_argument("--full", action="store_true", help="Force full re-fetch")
+
+    # list
+    p = sub.add_parser("list", help="List transactions")
+    p.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD)")
+    p.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD)")
+    p.add_argument("--payee", help="Filter by payee (substring match)")
+    p.add_argument("--tag", dest="tag_filter", help="Filter by tag name")
+    p.add_argument("--account", help="Filter by account name")
+    p.add_argument("--type", choices=["expense", "income", "transfer"], help="Transaction type")
+    p.add_argument("--untagged", action="store_true", help="Only untagged transactions")
+    p.add_argument("--min", dest="min_amount", type=float, help="Minimum amount")
+    p.add_argument("--max", dest="max_amount", type=float, help="Maximum amount")
+    p.add_argument("--limit", type=int, default=50, help="Max results (default 50)")
+
+    # show
+    p = sub.add_parser("show", help="Show transaction details")
+    p.add_argument("id", help="Transaction ID or prefix (min 4 chars)")
+
+    # accounts
+    p = sub.add_parser("accounts", help="List accounts")
+    p.add_argument("--all", action="store_true", help="Include archived accounts")
+
+    # tags
+    p = sub.add_parser("tags", help="List tags/categories")
+    p.add_argument("--flat", action="store_true", help="Flat list without parent info")
+
+    # tag-create
+    p = sub.add_parser("tag-create", help="Create a new tag/category")
+    p.add_argument("title", help="Tag name")
+    p.add_argument("--parent", help="Parent tag name (for subcategories)")
+    p.add_argument("--icon", help="Icon name (e.g. '1002_diningroom')")
+
+    # pending
+    sub.add_parser("pending", help="Show pending changes")
+
+    # tag-set
+    p = sub.add_parser("tag-set", help="Replace tags on transaction(s)")
+    p.add_argument("ids", nargs="+", help="Transaction ID prefix(es)")
+    p.add_argument("--tags", nargs="+", required=True, help="Tag name(s)")
+
+    # tag-add
+    p = sub.add_parser("tag-add", help="Add tags to transaction(s)")
+    p.add_argument("ids", nargs="+", help="Transaction ID prefix(es)")
+    p.add_argument("--tags", nargs="+", required=True, help="Tag name(s)")
+
+    # tag-remove
+    p = sub.add_parser("tag-remove", help="Remove tags from transaction(s)")
+    p.add_argument("ids", nargs="+", help="Transaction ID prefix(es)")
+    p.add_argument("--tags", nargs="*", default=[], help="Tag name(s) to remove (all if omitted)")
+
+    # edit
+    p = sub.add_parser("edit", help="Edit transaction fields")
+    p.add_argument("id", help="Transaction ID prefix")
+    p.add_argument("fields", nargs="+", help="field=value pairs (payee, comment, date, outcome, income)")
+
+    # merge
+    p = sub.add_parser("merge", help="Merge transactions (sum into first)")
+    p.add_argument("ids", nargs="+", help="Transaction ID prefixes (first is target)")
+
+    # make-transfer
+    p = sub.add_parser("make-transfer", help="Convert expense+income pair into transfer")
+    p.add_argument("expense_id", help="Expense transaction ID prefix")
+    p.add_argument("income_id", help="Income transaction ID prefix")
+
+    # delete
+    p = sub.add_parser("delete", help="Soft-delete transactions")
+    p.add_argument("ids", nargs="+", help="Transaction ID prefixes")
+
+    # undo
+    p = sub.add_parser("undo", help="Revert last pending change")
+    p.add_argument("--all", action="store_true", help="Revert all pending changes")
+
+    # push
+    p = sub.add_parser("push", help="Push pending changes to API")
+    p.add_argument("--dry-run", action="store_true", help="Preview without pushing")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    store = DataStore()
+
+    commands = {
+        "sync": cmd_sync,
+        "list": cmd_list,
+        "show": cmd_show,
+        "accounts": cmd_accounts,
+        "tags": cmd_tags,
+        "tag-create": cmd_tag_create,
+        "pending": cmd_pending,
+        "tag-set": cmd_tag_set,
+        "tag-add": cmd_tag_add,
+        "tag-remove": cmd_tag_remove,
+        "edit": cmd_edit,
+        "merge": cmd_merge,
+        "make-transfer": cmd_make_transfer,
+        "delete": cmd_delete,
+        "undo": cmd_undo,
+        "push": cmd_push,
+    }
+
+    cmd = commands.get(args.command)
+    if cmd:
+        cmd(args, store)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
