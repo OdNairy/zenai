@@ -37,7 +37,9 @@ All writes are local until pushed. Each command accepts one or more 4+ char ID p
 ./zm edit <id> payee="Name" comment="text" date=YYYY-MM-DD outcome=123.45
 ./zm delete <ids...>                            # soft-delete
 ./zm merge <id1> <id2> [id3...]                 # sum amounts into first, delete rest
-./zm make-transfer <expense-id> <income-id>     # combine into one transfer
+./zm make-transfer <expense-id> <income-id>     # combine expense+income pair into one transfer
+./zm convert-to-transfer <id> --to <account>    # convert standalone expense into transfer
+./zm convert-to-transfer <id> --from <account>  # convert standalone income into transfer
 ```
 
 ## Managing pending changes

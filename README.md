@@ -58,7 +58,9 @@ echo "YOUR_TOKEN" > data/token
 ./zm edit <id> payee="Name" comment="заметка"  # редактировать поля
 ./zm delete <id>                               # мягкое удаление
 ./zm merge <id1> <id2>                         # объединить (суммы в первую)
-./zm make-transfer <expense> <income>          # превратить в перевод
+./zm make-transfer <expense> <income>          # объединить пару expense+income в перевод
+./zm convert-to-transfer <id> --to "Счёт"     # expense → перевод (указать счёт назначения)
+./zm convert-to-transfer <id> --from "Счёт"   # income → перевод (указать счёт источника)
 ```
 
 ### Управление изменениями

@@ -828,6 +828,61 @@ def cmd_make_transfer(args, store):
     err(f"soft-deleted: {income_tx['id'][:8]}")
 
 
+def cmd_convert_to_transfer(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+
+    tx = resolve_id(txs, args.id)
+
+    is_expense = tx.get("outcome", 0) > 0 and tx.get("income", 0) == 0
+    is_income = tx.get("income", 0) > 0 and tx.get("outcome", 0) == 0
+
+    if not is_expense and not is_income:
+        die(f"{tx['id'][:8]} is already a transfer")
+
+    if is_expense:
+        if not args.to:
+            die("expense transaction requires --to <account>")
+        account = lk.resolve_account_name(args.to)
+        old = {
+            "income": tx.get("income", 0),
+            "incomeAccount": tx.get("incomeAccount"),
+            "incomeInstrument": tx.get("incomeInstrument"),
+        }
+        new = {
+            "income": tx.get("outcome", 0),
+            "incomeAccount": account["id"],
+            "incomeInstrument": account.get("instrument"),
+        }
+        err(f"converting expense → transfer")
+        err(f"  from: {lk.account_name(tx.get('outcomeAccount', ''))} ({tx.get('outcome', 0)})")
+        err(f"  to:   {account['title']} ({new['income']})")
+    else:
+        if not args.from_account:
+            die("income transaction requires --from <account>")
+        account = lk.resolve_account_name(args.from_account)
+        old = {
+            "outcome": tx.get("outcome", 0),
+            "outcomeAccount": tx.get("outcomeAccount"),
+            "outcomeInstrument": tx.get("outcomeInstrument"),
+        }
+        new = {
+            "outcome": tx.get("income", 0),
+            "outcomeAccount": account["id"],
+            "outcomeInstrument": account.get("instrument"),
+        }
+        err(f"converting income → transfer")
+        err(f"  from: {account['title']} ({new['outcome']})")
+        err(f"  to:   {lk.account_name(tx.get('incomeAccount', ''))} ({tx.get('income', 0)})")
+
+    store.add_pending("update", "transaction", tx["id"], old, new)
+    err(f"converted {tx['id'][:8]}")
+
+
 def cmd_undo(args, store):
     pending = store.read_pending()
     if not pending:
@@ -1009,6 +1064,12 @@ def build_parser():
     p.add_argument("expense_id", help="Expense transaction ID prefix")
     p.add_argument("income_id", help="Income transaction ID prefix")
 
+    # convert-to-transfer
+    p = sub.add_parser("convert-to-transfer", help="Convert standalone expense/income into a transfer")
+    p.add_argument("id", help="Transaction ID prefix")
+    p.add_argument("--to", dest="to", help="Destination account (for expense → transfer)")
+    p.add_argument("--from", dest="from_account", help="Source account (for income → transfer)")
+
     # delete
     p = sub.add_parser("delete", help="Soft-delete transactions")
     p.add_argument("ids", nargs="+", help="Transaction ID prefixes")
@@ -1053,6 +1114,7 @@ def main():
         "edit": cmd_edit,
         "merge": cmd_merge,
         "make-transfer": cmd_make_transfer,
+        "convert-to-transfer": cmd_convert_to_transfer,
         "delete": cmd_delete,
         "undo": cmd_undo,
         "push": cmd_push,

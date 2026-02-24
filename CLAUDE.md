@@ -36,6 +36,8 @@ CLI tool (`zm`) for managing ZenMoney transactions via API. Single Python file, 
 ./zm delete <id>
 ./zm merge <id1> <id2>              # sum amounts into first
 ./zm make-transfer <expense> <income>  # convert pair to transfer
+./zm convert-to-transfer <id> --to "Квартира в 🇫🇮"   # expense → transfer
+./zm convert-to-transfer <id> --from "Ипотека"         # income → transfer
 
 # Manage changes
 ./zm pending           # show uncommitted changes
