@@ -35,7 +35,7 @@ echo "YOUR_TOKEN" > data/token
 ./zm list --tag Продукты --account "Revolut EUR"
 ./zm list --min 100 --max 500
 
-./zm show <id>               # детали транзакции (достаточно 4+ символов id)
+./zm show <id> [<id2> ...]   # детали транзакции(й) (достаточно 4+ символов id)
 ./zm accounts                # список счетов
 ./zm tags                    # список категорий
 ```
@@ -45,6 +45,10 @@ echo "YOUR_TOKEN" > data/token
 Все изменения сначала сохраняются локально, на сервер отправляются командой `push`.
 
 ```bash
+./zm create --account "Revolut EUR" --outcome 1200 \
+  --date 2026-02-13 --payee "Bank" --tags "Банки" --comment "Комиссия"
+                                               # создать транзакцию с нуля
+
 ./zm tag-add <id> --tags "Продукты"           # добавить тег
 ./zm tag-set <id> --tags "Кафе" "Досуг"       # заменить теги
 ./zm tag-remove <id> --tags "Продукты"         # убрать тег

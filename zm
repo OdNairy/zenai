@@ -483,9 +483,11 @@ def cmd_show(args, store):
     lk = Lookup(raw)
     fmt = Formatter(lk)
 
-    tx = resolve_id(txs, args.id)
-    result = fmt.format_full(tx, tx["id"] in pending_ids)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    result = [fmt.format_full(tx := resolve_id(txs, i), tx["id"] in pending_ids) for i in args.ids]
+    if len(result) == 1:
+        print(json.dumps(result[0], ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def cmd_accounts(args, store):
@@ -949,7 +951,7 @@ def build_parser():
 
     # show
     p = sub.add_parser("show", help="Show transaction details")
-    p.add_argument("id", help="Transaction ID or prefix (min 4 chars)")
+    p.add_argument("ids", nargs="+", help="Transaction ID(s) or prefix(es) (min 4 chars)")
 
     # accounts
     p = sub.add_parser("accounts", help="List accounts")

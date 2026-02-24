@@ -19,9 +19,14 @@ CLI tool (`zm`) for managing ZenMoney transactions via API. Single Python file, 
 ./zm list --min 100 --max 500
 
 # Show details
-./zm show <id-prefix>
+./zm show <id-prefix> [<id2> ...]   # one or more transactions
 ./zm accounts
 ./zm tags
+
+# Create a new transaction from scratch
+./zm create --date 2026-02-13 --account "Nordea EUR" --outcome 1200 \
+  --payee "Nordea Bank Abp" --tags "Банки" \
+  --comment "Комиссия за выдачу ипотеки"
 
 # Modify transactions (creates local pending changes)
 ./zm tag-add <id> --tags "Продукты"

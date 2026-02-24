@@ -11,12 +11,20 @@ You have access to `./zm`, a CLI for reading and modifying ZenMoney transactions
 
 ```bash
 ./zm list [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--payee TEXT] [--tag NAME] [--account NAME] [--type expense|income|transfer] [--untagged] [--min N] [--max N] [--limit N]
-./zm show <id-prefix>       # full detail, accepts 4+ char UUID prefix
+./zm show <id-prefix> [<id2>...]  # full detail for one or more transactions (4+ char prefix)
 ./zm accounts [--all]       # list accounts (--all includes archived)
 ./zm tags [--flat]          # list categories
 ```
 
 Default limit is 50. Filters are substring matches (case-insensitive for payee/account/tag).
+
+## Creating transactions
+
+```bash
+./zm create --account "Account Name" --outcome 123.45   # expense
+./zm create --account "Account Name" --income 500.00    # income
+# Optional: --date YYYY-MM-DD (default: today), --payee TEXT, --tags "T1" "T2", --comment TEXT
+```
 
 ## Modifying transactions
 
