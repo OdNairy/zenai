@@ -185,6 +185,17 @@ class Lookup:
             die(f"ambiguous tag '{name}': {', '.join(names)}")
         die(f"tag not found: '{name}'")
 
+    def resolve_account_name(self, name):
+        """Resolve an account by name substring (non-archived). Returns account dict."""
+        matches = [a for a in self.accounts_by_id.values()
+                   if name.lower() in a["title"].lower() and not a.get("archive")]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) == 0:
+            die(f"account not found: '{name}'")
+        titles = [a["title"] for a in matches[:5]]
+        die(f"ambiguous account '{name}': {', '.join(titles)}")
+
 
 # ---------------------------------------------------------------------------
 # Formatter
@@ -331,9 +342,12 @@ def apply_pending_overlay(raw, pending):
             continue
         tid = mut["id"]
         pending_ids.add(tid)
-        if tid in tx_map:
-            tx_map[tid].update(mut["new"])
-        # note: we don't handle "create" action yet — only updates
+        if mut["action"] == "create":
+            if tid not in tx_map:
+                tx_map[tid] = dict(mut["new"])
+        else:
+            if tid in tx_map:
+                tx_map[tid].update(mut["new"])
     return list(tx_map.values()), pending_ids
 
 
@@ -550,6 +564,76 @@ def cmd_tag_create(args, store):
 
     err(f"created tag: {args.title} ({tag_id[:8]})")
     print(json.dumps({"id": tag_id[:8], "title": args.title, "parent": parent_id and lk.tag_name(parent_id)}, ensure_ascii=False, indent=2))
+
+
+def cmd_create(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    lk = Lookup(raw)
+    fmt = Formatter(lk)
+
+    if args.outcome is not None and args.income is not None:
+        die("specify either --outcome (expense) or --income, not both")
+    if args.outcome is None and args.income is None:
+        die("specify --outcome (expense) or --income")
+
+    is_expense = args.outcome is not None
+    amount = args.outcome if is_expense else args.income
+
+    account = lk.resolve_account_name(args.account)
+    account_id = account["id"]
+    instrument_id = account.get("instrument")
+    err(f"account: {account['title']} ({account_id[:8]})")
+
+    tag_ids = None
+    if args.tags:
+        tag_ids = []
+        for name in args.tags:
+            tid, title = lk.resolve_tag_name(name)
+            tag_ids.append(tid)
+            err(f"tag: {title} ({tid[:8]})")
+
+    users = raw.get("user", [])
+    user_id = users[0]["id"] if users else 0
+
+    date = args.date or datetime.now().strftime("%Y-%m-%d")
+    now_ts = int(time.time())
+    tx_id = str(uuid.uuid4())
+
+    tx_obj = {
+        "id": tx_id,
+        "user": user_id,
+        "date": date,
+        "income": 0.0 if is_expense else amount,
+        "outcome": amount if is_expense else 0.0,
+        "incomeAccount": account_id,
+        "outcomeAccount": account_id,
+        "incomeInstrument": instrument_id,
+        "outcomeInstrument": instrument_id,
+        "payee": args.payee,
+        "comment": args.comment,
+        "tag": tag_ids,
+        "deleted": False,
+        "hold": False,
+        "merchant": None,
+        "originalPayee": None,
+        "opIncome": None,
+        "opOutcome": None,
+        "opIncomeInstrument": None,
+        "opOutcomeInstrument": None,
+        "created": now_ts,
+        "changed": now_ts,
+    }
+
+    store.add_pending("create", "transaction", tx_id, {}, tx_obj)
+
+    # add to raw locally so list/show work without push
+    raw.setdefault("transaction", []).append(tx_obj)
+    store.write_raw(raw)
+
+    err(f"created transaction {tx_id[:8]}")
+    print(json.dumps(fmt.format_short(tx_obj, is_pending=True), ensure_ascii=False, indent=2))
 
 
 def cmd_pending(args, store):
@@ -881,6 +965,16 @@ def build_parser():
     p.add_argument("--parent", help="Parent tag name (for subcategories)")
     p.add_argument("--icon", help="Icon name (e.g. '1002_diningroom')")
 
+    # create
+    p = sub.add_parser("create", help="Create a new transaction")
+    p.add_argument("--date", help="Date (YYYY-MM-DD), default: today")
+    p.add_argument("--account", required=True, help="Account name (substring match)")
+    p.add_argument("--outcome", type=float, help="Expense amount")
+    p.add_argument("--income", type=float, help="Income amount")
+    p.add_argument("--payee", help="Payee / merchant name")
+    p.add_argument("--tags", nargs="+", help="Tag name(s)")
+    p.add_argument("--comment", help="Comment")
+
     # pending
     sub.add_parser("pending", help="Show pending changes")
 
@@ -949,6 +1043,7 @@ def main():
         "accounts": cmd_accounts,
         "tags": cmd_tags,
         "tag-create": cmd_tag_create,
+        "create": cmd_create,
         "pending": cmd_pending,
         "tag-set": cmd_tag_set,
         "tag-add": cmd_tag_add,
