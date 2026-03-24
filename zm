@@ -20,6 +20,12 @@ STATE_FILE = DATA_DIR / "state.json"
 PENDING_FILE = DATA_DIR / "pending.json"
 
 API_URL = "https://api.zenmoney.ru/v8/diff/"
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_TOKEN_FILE = DATA_DIR / "anthropic_token"
+
+
+class ResolveError(Exception):
+    pass
 
 
 def err(msg):
@@ -171,7 +177,7 @@ class Lookup:
         return m["title"] if m else mid
 
     def resolve_tag_name(self, name):
-        """Resolve a tag name (case-insensitive) to its UUID. Returns (uuid, title) or None."""
+        """Resolve a tag name (case-insensitive) to its UUID. Returns (uuid, title)."""
         t = self.tags_by_name.get(name.lower())
         if t:
             return t["id"], t["title"]
@@ -182,8 +188,8 @@ class Lookup:
             return matches[0][0], matches[0][1]["title"]
         if len(matches) > 1:
             names = [m[1]["title"] for m in matches]
-            die(f"ambiguous tag '{name}': {', '.join(names)}")
-        die(f"tag not found: '{name}'")
+            raise ResolveError(f"ambiguous tag '{name}': {', '.join(names)}")
+        raise ResolveError(f"tag not found: '{name}'")
 
     def resolve_account_name(self, name):
         """Resolve an account by name substring (non-archived). Returns account dict."""
@@ -192,9 +198,9 @@ class Lookup:
         if len(matches) == 1:
             return matches[0]
         if len(matches) == 0:
-            die(f"account not found: '{name}'")
+            raise ResolveError(f"account not found: '{name}'")
         titles = [a["title"] for a in matches[:5]]
-        die(f"ambiguous account '{name}': {', '.join(titles)}")
+        raise ResolveError(f"ambiguous account '{name}': {', '.join(titles)}")
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +239,7 @@ class Formatter:
     def format_short(self, tx, is_pending=False):
         ttype = self.tx_type(tx)
         obj = {
-            "id": tx["id"][:8],
+            "id": tx["id"][:12],
             "date": tx.get("date", ""),
             "type": ttype,
             "amount": self.format_amount(tx),
@@ -313,14 +319,14 @@ class Formatter:
 def resolve_id(transactions, prefix):
     """Resolve a UUID prefix (min 4 chars) to a full transaction."""
     if len(prefix) < 4:
-        die(f"ID prefix too short (min 4 chars): {prefix}")
+        raise ResolveError(f"ID prefix too short (min 4 chars): {prefix}")
     matches = [tx for tx in transactions if tx["id"].startswith(prefix)]
     if len(matches) == 1:
         return matches[0]
     if len(matches) == 0:
-        die(f"no transaction matching prefix: {prefix}")
+        raise ResolveError(f"no transaction matching prefix: {prefix}")
     ids = [f"  {m['id'][:12]}  {m.get('date','')}  {m.get('payee','')}" for m in matches[:10]]
-    die(f"ambiguous prefix '{prefix}', matches:\n" + "\n".join(ids))
+    raise ResolveError(f"ambiguous prefix '{prefix}', matches:\n" + "\n".join(ids))
 
 
 def resolve_ids(transactions, prefixes):
@@ -388,6 +394,10 @@ def filter_transactions(txs, args, pending_ids=None):
         if hasattr(args, 'untagged') and args.untagged:
             if tx.get("tag"):
                 continue
+            # exclude transfers unless --include-transfers
+            if not getattr(args, 'include_transfers', False):
+                if tx.get("income", 0) > 0 and tx.get("outcome", 0) > 0:
+                    continue
         if hasattr(args, 'tag_filter') and args.tag_filter:
             tx_tags = tx.get("tag") or []
             tag_names_lower = [lookup_global.tag_name(t).lower() for t in tx_tags]
@@ -735,9 +745,24 @@ def cmd_edit(args, store):
             die(f"invalid field assignment: {assignment} (expected field=value)")
         field, value = assignment.split("=", 1)
         field = field.strip()
-        allowed = {"payee", "comment", "date", "outcome", "income"}
+        allowed = {"payee", "comment", "date", "outcome", "income", "tags"}
         if field not in allowed:
             die(f"cannot edit field '{field}'. Allowed: {', '.join(sorted(allowed))}")
+        if field == "tags":
+            if value.strip() == "":
+                old["tag"] = tx.get("tag")
+                new["tag"] = None
+            else:
+                tag_ids = []
+                for name in value.split(","):
+                    name = name.strip()
+                    if name:
+                        tid, title = lk.resolve_tag_name(name)
+                        tag_ids.append(tid)
+                        err(f"  tag: {title} ({tid[:8]})")
+                old["tag"] = tx.get("tag")
+                new["tag"] = tag_ids
+            continue
         if field in ("outcome", "income"):
             value = float(value)
         old[field] = tx.get(field)
@@ -892,10 +917,382 @@ def cmd_undo(args, store):
     if args.all:
         store.write_pending([])
         err(f"reverted all {len(pending)} pending changes.")
+    elif args.id:
+        prefix = args.id
+        if len(prefix) < 4:
+            die(f"ID prefix too short (min 4 chars): {prefix}")
+        matching = [m for m in pending if m["id"].startswith(prefix)]
+        if not matching:
+            die(f"no pending changes for prefix: {prefix}")
+        remaining = [m for m in pending if not m["id"].startswith(prefix)]
+        store.write_pending(remaining)
+        err(f"reverted {len(matching)} pending change(s) for {prefix}")
     else:
         removed = pending.pop()
         store.write_pending(pending)
         err(f"reverted: {removed['action']} {removed['entity']} {removed['id'][:8]}")
+
+
+def cmd_batch(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+
+    succeeded = 0
+    failed = 0
+
+    for lineno, line in enumerate(sys.stdin, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            err(f"line {lineno}: invalid JSON: {e}")
+            failed += 1
+            continue
+
+        prefix = obj.get("id")
+        if not prefix:
+            err(f"line {lineno}: missing 'id' field")
+            failed += 1
+            continue
+
+        try:
+            tx = resolve_id(txs, prefix)
+        except ResolveError as e:
+            err(f"line {lineno}: {e}")
+            failed += 1
+            continue
+
+        old = {}
+        new = {}
+        line_ok = True
+
+        for field, value in obj.items():
+            if field == "id":
+                continue
+            if field == "tags":
+                try:
+                    tag_ids = []
+                    for name in value:
+                        tid, title = lk.resolve_tag_name(name)
+                        tag_ids.append(tid)
+                    old["tag"] = tx.get("tag")
+                    new["tag"] = tag_ids if tag_ids else None
+                except ResolveError as e:
+                    err(f"line {lineno}: {e}")
+                    line_ok = False
+                    break
+            elif field in ("payee", "comment", "date"):
+                old[field] = tx.get(field)
+                new[field] = value
+            elif field in ("outcome", "income"):
+                old[field] = tx.get(field)
+                new[field] = float(value)
+            else:
+                err(f"line {lineno}: unknown field '{field}', skipping")
+
+        if not line_ok:
+            failed += 1
+            continue
+
+        if new:
+            if args.dry_run:
+                err(f"line {lineno}: would edit {tx['id'][:12]}: {new}")
+            else:
+                store.add_pending("update", "transaction", tx["id"], old, new)
+                err(f"line {lineno}: edited {tx['id'][:12]}: {list(new.keys())}")
+            succeeded += 1
+        else:
+            err(f"line {lineno}: no changes for {tx['id'][:12]}")
+
+    err(f"\nbatch complete: {succeeded} succeeded, {failed} failed")
+
+
+# ---------------------------------------------------------------------------
+# Review
+# ---------------------------------------------------------------------------
+
+def build_payee_tag_map(transactions):
+    """Build map: payee_lower -> {tag_id: count} from all non-deleted transactions."""
+    payee_tags = {}
+    for tx in transactions:
+        if tx.get("deleted"):
+            continue
+        payee = (tx.get("payee") or tx.get("originalPayee") or "").strip()
+        if not payee:
+            continue
+        tags = tx.get("tag") or []
+        key = payee.lower()
+        if key not in payee_tags:
+            payee_tags[key] = {}
+        for tid in tags:
+            payee_tags[key][tid] = payee_tags[key].get(tid, 0) + 1
+    return payee_tags
+
+
+def get_dominant_tag(tag_counts):
+    """Return (tag_id, count, total) for most frequent tag, or None."""
+    if not tag_counts:
+        return None
+    total = sum(tag_counts.values())
+    best = max(tag_counts, key=tag_counts.get)
+    return best, tag_counts[best], total
+
+
+def review_ai_suggest(unknown_items, lk, store):
+    """Call Anthropic API to classify unknown payees. Returns list of suggestions."""
+    if not ANTHROPIC_TOKEN_FILE.exists():
+        err("no anthropic token at data/anthropic_token, skipping AI suggestions")
+        return []
+
+    token = ANTHROPIC_TOKEN_FILE.read_text().strip()
+
+    # Collect unique payees with amounts
+    payee_amounts = {}
+    for item in unknown_items:
+        tx = item["tx"]
+        payee = tx.get("payee") or tx.get("originalPayee") or "unknown"
+        amount = tx.get("outcome", 0) or tx.get("income", 0)
+        payee_amounts.setdefault(payee, []).append(amount)
+
+    all_tags = sorted(set(t["title"] for t in lk.tags_by_id.values()))
+    payee_list = "\n".join(f"- {p} (amounts: {', '.join(f'{a:.2f}' for a in amts)})"
+                           for p, amts in payee_amounts.items())
+    tag_list = ", ".join(all_tags)
+
+    prompt = (
+        f"Classify these merchant/payee names into expense categories.\n"
+        f"Available categories: {tag_list}\n\n"
+        f"Payees:\n{payee_list}\n\n"
+        f"Respond with ONLY a JSON array: "
+        f'[{{"payee": "...", "tag": "...", "confidence": 0.0-1.0}}]\n'
+        f"Use only categories from the list above. If unsure, set confidence below 0.5. "
+        f"If completely unknown, set tag to null."
+    )
+
+    body = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode()
+
+    req = urllib.request.Request(
+        ANTHROPIC_API_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": token,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        err(f"Anthropic API error: {e}")
+        return []
+
+    text = result["content"][0]["text"]
+    # Extract JSON array from response
+    import re
+    json_match = re.search(r'\[.*\]', text, re.DOTALL)
+    if not json_match:
+        err("could not parse AI response")
+        return []
+
+    try:
+        suggestions = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        err("could not parse AI response JSON")
+        return []
+
+    # Map suggestions back to items
+    payee_suggestion = {s["payee"].lower(): s for s in suggestions if s.get("tag")}
+    ai_results = []
+    for item in unknown_items:
+        tx = item["tx"]
+        payee = (tx.get("payee") or tx.get("originalPayee") or "").lower()
+        s = payee_suggestion.get(payee)
+        if not s:
+            continue
+        tag_match = lk.tags_by_name.get(s["tag"].lower())
+        if tag_match:
+            ai_results.append({
+                "tx": tx,
+                "suggested_tag": tag_match["id"],
+                "confidence": s.get("confidence", 0),
+                "source": "ai",
+            })
+
+    return ai_results
+
+
+def cmd_review(args, store):
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+    fmt = Formatter(lk)
+
+    payee_tags = build_payee_tag_map(txs)
+
+    from_date = args.from_date or (datetime.now().strftime("%Y-%m") + "-01")
+    to_date = args.to_date
+
+    suspicious = []
+    untagged_hist = []
+    untagged_unknown = []
+
+    for tx in txs:
+        if tx.get("deleted"):
+            continue
+        d = tx.get("date", "")
+        if d < from_date:
+            continue
+        if to_date and d > to_date:
+            continue
+        # skip transfers
+        if tx.get("income", 0) > 0 and tx.get("outcome", 0) > 0:
+            continue
+
+        payee = (tx.get("payee") or tx.get("originalPayee") or "").strip()
+        payee_key = payee.lower()
+        history = payee_tags.get(payee_key, {})
+        dominant = get_dominant_tag(history)
+        tx_tags = tx.get("tag") or []
+
+        if tx_tags:
+            if dominant:
+                dom_tid, dom_count, dom_total = dominant
+                ratio = dom_count / dom_total
+                if ratio >= 0.8 and dom_tid not in tx_tags:
+                    suspicious.append({
+                        "tx": tx,
+                        "current_tags": tx_tags,
+                        "suggested_tag": dom_tid,
+                        "count": dom_count,
+                        "total": dom_total,
+                    })
+        else:
+            if dominant and payee:
+                dom_tid, dom_count, dom_total = dominant
+                untagged_hist.append({
+                    "tx": tx,
+                    "suggested_tag": dom_tid,
+                    "count": dom_count,
+                    "total": dom_total,
+                })
+            else:
+                untagged_unknown.append({"tx": tx})
+
+    # Sort all by date
+    suspicious.sort(key=lambda x: x["tx"].get("date", ""), reverse=True)
+    untagged_hist.sort(key=lambda x: x["tx"].get("date", ""), reverse=True)
+    untagged_unknown.sort(key=lambda x: x["tx"].get("date", ""), reverse=True)
+
+    # Print suspicious
+    if suspicious:
+        print(f"\nSUSPICIOUS — tag differs from history ({len(suspicious)}):")
+        for item in suspicious:
+            tx = item["tx"]
+            cur_names = ", ".join(lk.tag_names(item["current_tags"]))
+            sug_name = lk.tag_name(item["suggested_tag"])
+            payee = tx.get("payee") or tx.get("originalPayee") or "—"
+            print(f"  {tx['id'][:12]}  {tx.get('date','')}  {fmt.format_amount(tx):>16}  {payee}"
+                  f"  {cur_names} → {sug_name}? ({item['count']}/{item['total']})")
+
+    # Print untagged with suggestions
+    if untagged_hist:
+        print(f"\nUNTAGGED — suggestion from history ({len(untagged_hist)}):")
+        for item in untagged_hist:
+            tx = item["tx"]
+            sug_name = lk.tag_name(item["suggested_tag"])
+            payee = tx.get("payee") or tx.get("originalPayee") or "—"
+            print(f"  {tx['id'][:12]}  {tx.get('date','')}  {fmt.format_amount(tx):>16}  {payee}"
+                  f"  → {sug_name} ({item['count']}/{item['total']})")
+
+    # AI tier
+    ai_results = []
+    if args.ai and untagged_unknown:
+        err(f"\nCalling AI for {len(untagged_unknown)} unknown payee(s)...")
+        ai_results = review_ai_suggest(untagged_unknown, lk, store)
+        # Separate AI-resolved from still-unknown
+        ai_resolved_ids = {item["tx"]["id"] for item in ai_results}
+        still_unknown = [item for item in untagged_unknown if item["tx"]["id"] not in ai_resolved_ids]
+
+        if ai_results:
+            print(f"\nUNTAGGED — AI suggestion ({len(ai_results)}):")
+            for item in ai_results:
+                tx = item["tx"]
+                sug_name = lk.tag_name(item["suggested_tag"])
+                payee = tx.get("payee") or tx.get("originalPayee") or "—"
+                conf = item.get("confidence", 0)
+                print(f"  {tx['id'][:12]}  {tx.get('date','')}  {fmt.format_amount(tx):>16}  {payee}"
+                      f"  → {sug_name} (confidence: {conf:.0%})")
+
+        if still_unknown:
+            print(f"\nUNTAGGED — unknown ({len(still_unknown)}):")
+            for item in still_unknown:
+                tx = item["tx"]
+                payee = tx.get("payee") or tx.get("originalPayee") or "—"
+                print(f"  {tx['id'][:12]}  {tx.get('date','')}  {fmt.format_amount(tx):>16}  {payee}")
+    elif untagged_unknown:
+        print(f"\nUNTAGGED — no history ({len(untagged_unknown)}):")
+        for item in untagged_unknown:
+            tx = item["tx"]
+            payee = tx.get("payee") or tx.get("originalPayee") or "—"
+            print(f"  {tx['id'][:12]}  {tx.get('date','')}  {fmt.format_amount(tx):>16}  {payee}")
+
+    # Summary
+    total = len(suspicious) + len(untagged_hist) + len(untagged_unknown)
+    if total == 0:
+        print("\nAll transactions look good!")
+        return
+
+    # Apply mode
+    if not args.apply:
+        print(f"\nUse --apply to interactively apply suggestions.")
+        return
+
+    # Collect confident suggestions
+    to_apply = []
+    for item in untagged_hist:
+        if item["count"] >= 3:
+            to_apply.append(item)
+    for item in ai_results:
+        if item.get("confidence", 0) >= 0.8:
+            to_apply.append(item)
+
+    if not to_apply:
+        err("no confident suggestions to auto-apply.")
+        return
+
+    sys.stderr.write(f"\n{len(to_apply)} confident suggestion(s). Apply? [y/N] ")
+    sys.stderr.flush()
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        return
+    if answer != "y":
+        err("skipped.")
+        return
+
+    for item in to_apply:
+        tx = item["tx"]
+        tag_id = item["suggested_tag"]
+        store.add_pending("update", "transaction", tx["id"],
+                         {"tag": tx.get("tag")}, {"tag": [tag_id]})
+        err(f"  applied: {tx['id'][:12]} → {lk.tag_name(tag_id)}")
+
+    err(f"applied {len(to_apply)} change(s). Use 'zm push' to send to API.")
 
 
 def cmd_push(args, store):
@@ -1000,6 +1397,7 @@ def build_parser():
     p.add_argument("--account", help="Filter by account name")
     p.add_argument("--type", choices=["expense", "income", "transfer"], help="Transaction type")
     p.add_argument("--untagged", action="store_true", help="Only untagged transactions")
+    p.add_argument("--include-transfers", action="store_true", help="Include transfers in --untagged results")
     p.add_argument("--min", dest="min_amount", type=float, help="Minimum amount")
     p.add_argument("--max", dest="max_amount", type=float, help="Maximum amount")
     p.add_argument("--limit", type=int, default=50, help="Max results (default 50)")
@@ -1053,7 +1451,7 @@ def build_parser():
     # edit
     p = sub.add_parser("edit", help="Edit transaction fields")
     p.add_argument("id", help="Transaction ID prefix")
-    p.add_argument("fields", nargs="+", help="field=value pairs (payee, comment, date, outcome, income)")
+    p.add_argument("fields", nargs="+", help="field=value pairs (payee, comment, date, outcome, income, tags=\"Tag1,Tag2\")")
 
     # merge
     p = sub.add_parser("merge", help="Merge transactions (sum into first)")
@@ -1076,7 +1474,19 @@ def build_parser():
 
     # undo
     p = sub.add_parser("undo", help="Revert last pending change")
+    p.add_argument("id", nargs="?", default=None, help="Transaction ID prefix to undo all changes for")
     p.add_argument("--all", action="store_true", help="Revert all pending changes")
+
+    # batch
+    p = sub.add_parser("batch", help="Apply bulk edits from stdin (JSON-lines)")
+    p.add_argument("--dry-run", action="store_true", help="Preview without applying")
+
+    # review
+    p = sub.add_parser("review", help="Review and suggest tags for transactions")
+    p.add_argument("--from", dest="from_date", help="Start date (default: current month)")
+    p.add_argument("--to", dest="to_date", help="End date")
+    p.add_argument("--ai", action="store_true", help="Use AI for unknown payees")
+    p.add_argument("--apply", action="store_true", help="Interactively apply suggestions")
 
     # push
     p = sub.add_parser("push", help="Push pending changes to API")
@@ -1117,12 +1527,17 @@ def main():
         "convert-to-transfer": cmd_convert_to_transfer,
         "delete": cmd_delete,
         "undo": cmd_undo,
+        "batch": cmd_batch,
+        "review": cmd_review,
         "push": cmd_push,
     }
 
     cmd = commands.get(args.command)
     if cmd:
-        cmd(args, store)
+        try:
+            cmd(args, store)
+        except ResolveError as e:
+            die(str(e))
     else:
         parser.print_help()
         sys.exit(1)

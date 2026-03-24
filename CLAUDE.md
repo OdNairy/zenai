@@ -32,16 +32,26 @@ CLI tool (`zm`) for managing ZenMoney transactions via API. Single Python file, 
 ./zm tag-add <id> --tags "Продукты"
 ./zm tag-set <id1> <id2> --tags "Кафе" "Досуг"
 ./zm tag-remove <id> --tags "Продукты"
-./zm edit <id> payee="New Payee" comment="note"
+./zm edit <id> payee="New Payee" comment="note" tags="Продукты,Кафе"
 ./zm delete <id>
 ./zm merge <id1> <id2>              # sum amounts into first
 ./zm make-transfer <expense> <income>  # convert pair to transfer
 ./zm convert-to-transfer <id> --to "Квартира в 🇫🇮"   # expense → transfer
 ./zm convert-to-transfer <id> --from "Ипотека"         # income → transfer
 
+# Bulk edits from stdin (JSON-lines)
+echo '{"id":"c557","tags":["Приложения"],"comment":"domain"}' | ./zm batch
+echo '...' | ./zm batch --dry-run  # preview
+
+# Review categories
+./zm review --from 2026-02-01              # history-based suggestions
+./zm review --from 2026-02-01 --ai         # + AI for unknown payees
+./zm review --from 2026-02-01 --ai --apply # + interactively apply
+
 # Manage changes
 ./zm pending           # show uncommitted changes
 ./zm undo              # revert last change
+./zm undo <id-prefix>  # revert changes for specific transaction
 ./zm undo --all        # revert all changes
 ./zm push --dry-run    # preview API push
 ./zm push              # send to ZenMoney API
@@ -50,9 +60,9 @@ CLI tool (`zm`) for managing ZenMoney transactions via API. Single Python file, 
 ## Architecture
 
 - **Single file:** `zm` (Python 3, no dependencies beyond stdlib)
-- **Data dir:** `data/` (gitignored) — contains `token`, `raw.json`, `state.json`, `pending.json`
+- **Data dir:** `data/` (gitignored) — contains `token`, `raw.json`, `state.json`, `pending.json`, optionally `anthropic_token`
 - All output is **denormalized JSON to stdout**, errors/status to stderr
-- IDs accept UUID prefixes (min 4 chars); ambiguous prefix → error with matches
+- IDs shown as 12-char prefixes in list output; accept UUID prefixes (min 4 chars); ambiguous prefix → error with matches
 - Transaction amounts are in **currency units** (not kopecks)
 - Tags are `null` or `["uuid1", ...]` arrays
 
@@ -70,7 +80,8 @@ CLI tool (`zm`) for managing ZenMoney transactions via API. Single Python file, 
 1. Write commands append to `pending.json` with old/new field values
 2. `zm list`/`zm show` overlay pending changes on raw data
 3. `zm push` merges pending by (entity, id), POSTs to API, updates raw.json, clears pending
-4. `zm undo` removes last (or all) pending entries
+4. `zm undo` removes last, by ID prefix, or all pending entries
+5. `zm review` analyzes payee→tag history to detect suspicious categories and suggest tags for untagged transactions; optionally calls Anthropic Haiku API for unknown payees
 
 ## ZenMoney API
 
