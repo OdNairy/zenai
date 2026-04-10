@@ -83,6 +83,12 @@ echo '...' | ./zm batch --dry-run  # preview
 4. `zm undo` removes last, by ID prefix, or all pending entries
 5. `zm review` analyzes payee→tag history to detect suspicious categories and suggest tags for untagged transactions; optionally calls Anthropic Haiku API for unknown payees
 
+## Skill File
+
+`skill/SKILL.md` is a Claude Code skill that makes `zm` available from any chat session.
+
+**After adding or changing any command**, update `skill/SKILL.md` to reflect the change — keep the command reference table and workflow examples in sync with the actual `zm` behavior.
+
 ## ZenMoney API
 
 - Endpoint: `https://api.zenmoney.ru/v8/diff/`
