@@ -292,6 +292,7 @@ class Formatter:
             "type": acc.get("type"),
             "currency": cur,
             "balance": acc.get("balance", 0),
+            "inBalance": acc.get("inBalance", False),
             "archived": acc.get("archive", False),
         }
 
