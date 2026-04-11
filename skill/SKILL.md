@@ -82,6 +82,20 @@ zm push --dry-run      # preview
 zm push                # send to ZenMoney API
 ```
 
+### Expense / income report
+```bash
+zm report --last 12m                        # last 12 full months, inBalance, grouped by category
+zm report --last 12m --group-by project     # group by project (last tag)
+zm report --last 12m --group-by month       # monthly breakdown
+zm report --last 12m --monthly              # category groups + per-month sub-breakdown
+zm report --last 12m --project "Турция"     # drill-down: only that project, grouped by category
+zm report --from 2025-01-01 --to 2025-12-31 --type income
+zm report --last 12m --all-accounts         # include accounts not in inBalance
+```
+
+Output fields: `period`, `baseCurrency`, `accounts`, `totalTransactions`, `total`, `groups[]`.  
+Each group: `name`, `type` (category/project/month), `total`, `avgPerMonth`, `pctOfTotal`, optionally `months`.
+
 ### Sync
 ```bash
 zm sync                # incremental sync
@@ -117,6 +131,7 @@ zm tags                # list tags/categories with IDs
 | `undo` | Revert pending change(s) |
 | `batch` | Bulk edits from stdin (JSON-lines) |
 | `review` | Suggest tags based on history (optionally AI-powered) |
+| `report` | Aggregate expense/income report by category/project/month |
 | `push` | Push pending changes to API |
 
 ## Output fields

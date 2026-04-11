@@ -561,6 +561,18 @@ def filter_transactions(txs, args, pending_ids=None):
 lookup_global = None
 
 
+def _count_months(from_date, to_date):
+    """Count calendar months in [from_date, to_date] inclusive."""
+    if not from_date or not to_date:
+        return 1
+    try:
+        d1 = date.fromisoformat(from_date)
+        d2 = date.fromisoformat(to_date)
+    except ValueError:
+        return 1
+    return max(1, (d2.year - d1.year) * 12 + (d2.month - d1.month) + 1)
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -1443,6 +1455,127 @@ def cmd_review(args, store):
     err(f"applied {len(to_apply)} change(s). Use 'zm push' to send to API.")
 
 
+def cmd_report(args, store):
+    global lookup_global
+    raw = store.read_raw()
+    if not raw:
+        die("no data. Run 'zm sync' first.")
+
+    pending = store.read_pending()
+    txs, pending_ids = apply_pending_overlay(raw, pending)
+    lk = Lookup(raw)
+    lookup_global = lk
+    fmt = Formatter(lk)
+
+    resolve_date_range(args)
+
+    if args.base_currency != "EUR":
+        die("only EUR base currency is currently supported")
+
+    from_date = args.from_date
+    to_date = args.to_date
+    in_balance = not args.all_accounts
+    tx_type = args.tx_type
+    group_by = args.group_by
+    project_filter = args.project
+
+    # Filter transactions
+    result_txs = []
+    for tx in txs:
+        if tx.get("deleted"):
+            continue
+        d = tx.get("date", "")
+        if from_date and d < from_date:
+            continue
+        if to_date and d > to_date:
+            continue
+
+        is_transfer = tx.get("income", 0) > 0 and tx.get("outcome", 0) > 0
+        is_income_tx = tx.get("income", 0) > 0 and not is_transfer
+        is_expense_tx = not is_income_tx and not is_transfer
+
+        if tx_type == "expense" and not is_expense_tx:
+            continue
+        if tx_type == "income" and not is_income_tx:
+            continue
+
+        if in_balance:
+            acct_id = tx.get("outcomeAccount") if tx_type == "expense" else tx.get("incomeAccount")
+            if acct_id not in lk.in_balance_account_ids:
+                continue
+
+        result_txs.append(tx)
+
+    # Project drill-down: filter to project, then group by category
+    if project_filter:
+        result_txs = [
+            tx for tx in result_txs
+            if (lambda p: p and project_filter.lower() in p.lower())(
+                resolve_tag_roles(tx.get("tag") or [], lk)[1]
+            )
+        ]
+        group_by = "category"
+
+    # Aggregate
+    groups = {}  # name -> {"total": float, "type": str, "months": {}}
+
+    for tx in result_txs:
+        eur = fmt._amount_eur(tx)
+        if eur is None:
+            continue
+        amount = abs(eur)
+        month = tx.get("date", "")[:7]
+        category, project = resolve_tag_roles(tx.get("tag") or [], lk)
+
+        if group_by == "month":
+            key = month
+            gtype = "month"
+        elif group_by == "project":
+            key = project or "(без проекта)"
+            gtype = "project"
+        else:  # category (or drill-down by category)
+            if project and not project_filter:
+                # project absorbs the transaction only when NOT in drill-down mode
+                key = project
+                gtype = "project"
+            else:
+                key = category
+                gtype = "category"
+
+        if key not in groups:
+            groups[key] = {"total": 0.0, "type": gtype, "months": {}}
+        groups[key]["total"] += amount
+        if args.monthly:
+            groups[key]["months"][month] = groups[key]["months"].get(month, 0.0) + amount
+
+    grand_total = sum(g["total"] for g in groups.values())
+    num_months = _count_months(from_date, to_date)
+
+    groups_list = []
+    for name, g in sorted(groups.items(), key=lambda x: -x[1]["total"]):
+        entry = {
+            "name": name,
+            "type": g["type"],
+            "total": round(g["total"], 2),
+            "avgPerMonth": round(g["total"] / num_months, 2) if num_months else None,
+            "pctOfTotal": round(g["total"] / grand_total * 100, 1) if grand_total else 0.0,
+        }
+        if args.monthly and g["months"]:
+            entry["months"] = {k: round(v, 2) for k, v in sorted(g["months"].items())}
+        groups_list.append(entry)
+
+    output = {
+        "period": {"from": from_date, "to": to_date, "months": num_months},
+        "baseCurrency": args.base_currency,
+        "accounts": "all" if args.all_accounts else "inBalance",
+        "totalTransactions": len(result_txs),
+        "total": round(grand_total, 2),
+        "groups": groups_list,
+    }
+
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
 def cmd_push(args, store):
     raw = store.read_raw()
     pending = store.read_pending()
@@ -1643,6 +1776,22 @@ def build_parser():
     p.add_argument("--ai", action="store_true", help="Use AI for unknown payees")
     p.add_argument("--apply", action="store_true", help="Interactively apply suggestions")
 
+    # report
+    p = sub.add_parser("report", help="Aggregate expense/income report")
+    p.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD)")
+    p.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD)")
+    p.add_argument("--last", help="Date shortcut: Nm (months), Ny (years), ytd")
+    p.add_argument("--all-accounts", dest="all_accounts", action="store_true",
+                   help="Include all accounts (default: inBalance only)")
+    p.add_argument("--base-currency", dest="base_currency", default="EUR",
+                   help="Base currency for aggregation (default: EUR)")
+    p.add_argument("--type", dest="tx_type", choices=["expense", "income"], default="expense",
+                   help="Transaction type (default: expense)")
+    p.add_argument("--group-by", dest="group_by", choices=["category", "project", "month"],
+                   default="category", help="Grouping dimension (default: category)")
+    p.add_argument("--monthly", action="store_true", help="Add per-month breakdown to each group")
+    p.add_argument("--project", help="Drill-down: filter by project name, group by category")
+
     # push
     p = sub.add_parser("push", help="Push pending changes to API")
     p.add_argument("--dry-run", action="store_true", help="Preview without pushing")
@@ -1684,6 +1833,7 @@ def main():
         "undo": cmd_undo,
         "batch": cmd_batch,
         "review": cmd_review,
+        "report": cmd_report,
         "push": cmd_push,
     }
 
