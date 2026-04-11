@@ -136,8 +136,11 @@ class Lookup:
         self._build()
 
     def _build(self):
+        self.in_balance_account_ids = set()
         for a in self.raw.get("account", []):
             self.accounts_by_id[a["id"]] = a
+            if a.get("inBalance"):
+                self.in_balance_account_ids.add(a["id"])
         for t in self.raw.get("tag", []):
             self.tags_by_id[t["id"]] = t
             self.tags_by_name[t["title"].lower()] = t
@@ -433,6 +436,15 @@ def filter_transactions(txs, args, pending_ids=None):
             tx_tags = tx.get("tag") or []
             tag_names_lower = [lookup_global.tag_name(t).lower() for t in tx_tags]
             if not any(args.tag_filter.lower() in n for n in tag_names_lower):
+                continue
+        if getattr(args, 'in_balance', False):
+            ttype = "transfer" if tx.get("income", 0) > 0 and tx.get("outcome", 0) > 0 else \
+                    "income" if tx.get("income", 0) > 0 else "expense"
+            if ttype == "expense":
+                acct_id = tx.get("outcomeAccount")
+            else:
+                acct_id = tx.get("incomeAccount")
+            if acct_id not in lookup_global.in_balance_account_ids:
                 continue
         if hasattr(args, 'min_amount') and args.min_amount is not None:
             amt = max(tx.get("income", 0), tx.get("outcome", 0))
@@ -1429,6 +1441,7 @@ def build_parser():
     p.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD)")
     p.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD)")
     p.add_argument("--last", help="Date shortcut: Nm (last N full months), Ny (last N full years), ytd (year-to-date)")
+    p.add_argument("--in-balance", dest="in_balance", action="store_true", help="Only transactions from inBalance accounts")
     p.add_argument("--payee", help="Filter by payee (substring match)")
     p.add_argument("--tag", dest="tag_filter", help="Filter by tag name")
     p.add_argument("--account", help="Filter by account name")
