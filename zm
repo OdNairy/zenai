@@ -322,6 +322,9 @@ class Formatter:
             obj["account"] = self.lk.account_name(acct or "")
         obj["payee"] = tx.get("payee") or tx.get("originalPayee") or self.lk.merchant_name(tx.get("merchant")) or None
         obj["tags"] = self.lk.tag_names(tx.get("tag"))
+        category, project = resolve_tag_roles(tx.get("tag") or [], self.lk)
+        obj["category"] = category
+        obj["project"] = project
         obj["comment"] = tx.get("comment")
         if is_pending:
             obj["pending"] = True
@@ -426,6 +429,29 @@ def apply_pending_overlay(raw, pending):
             if tid in tx_map:
                 tx_map[tid].update(mut["new"])
     return list(tx_map.values()), pending_ids
+
+
+# ---------------------------------------------------------------------------
+# Tag roles
+# ---------------------------------------------------------------------------
+
+def resolve_tag_roles(tag_ids, lk):
+    """Return (category_name, project_name | None) from a transaction's tag list.
+
+    Rules:
+    - 0 tags → ("(без категории)", None)
+    - 1 tag  → (tags[0], None)
+    - 2+ tags → (tags[0], tags[-1]); middle tags are ignored for aggregation
+    Unknown/deleted tags (UUID not in lookup) are skipped.
+    """
+    if not tag_ids:
+        return ("(без категории)", None)
+    names = [lk.tag_name(t) for t in tag_ids if lk.tags_by_id.get(t)]
+    if not names:
+        return ("(без категории)", None)
+    if len(names) == 1:
+        return (names[0], None)
+    return (names[0], names[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -810,10 +836,17 @@ def cmd_tag_add(args, store):
         tag_ids.append(tid)
         err(f"tag: {title} ({tid[:8]})")
 
+    as_category = getattr(args, 'as_category', False)
+
     for prefix in args.ids:
         tx = resolve_id(txs, prefix)
         old_tags = tx.get("tag") or []
-        new_tags = list(set(old_tags + tag_ids))
+        # deduplicate preserving order, new tags go to front (--as-category) or back (default)
+        new_ids = [t for t in tag_ids if t not in old_tags]
+        if as_category:
+            new_tags = new_ids + old_tags
+        else:
+            new_tags = old_tags + new_ids
         store.add_pending("update", "transaction", tx["id"], {"tag": tx.get("tag")}, {"tag": new_tags})
         err(f"  {tx['id'][:8]}: tags → {lk.tag_names(new_tags)}")
 
@@ -1559,6 +1592,11 @@ def build_parser():
     p = sub.add_parser("tag-add", help="Add tags to transaction(s)")
     p.add_argument("ids", nargs="+", help="Transaction ID prefix(es)")
     p.add_argument("--tags", nargs="+", required=True, help="Tag name(s)")
+    pos = p.add_mutually_exclusive_group()
+    pos.add_argument("--as-category", dest="as_category", action="store_true",
+                     help="Insert tag(s) at front (category role)")
+    pos.add_argument("--as-project", dest="as_category", action="store_false",
+                     help="Append tag(s) at end (project role, default)")
 
     # tag-remove
     p = sub.add_parser("tag-remove", help="Remove tags from transaction(s)")
