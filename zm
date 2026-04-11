@@ -415,10 +415,11 @@ def filter_transactions(txs, args, pending_ids=None):
         results.append(tx)
     # sort by date descending
     results.sort(key=lambda t: t.get("date", ""), reverse=True)
+    total = len(results)
     limit = getattr(args, 'limit', None)
     if limit:
         results = results[:limit]
-    return results
+    return results, total
 
 
 # Global lookup for filter helper
@@ -480,7 +481,10 @@ def cmd_list(args, store):
     lookup_global = lk
     fmt = Formatter(lk)
 
-    filtered = filter_transactions(txs, args, pending_ids)
+    filtered, total = filter_transactions(txs, args, pending_ids)
+    limit = getattr(args, 'limit', None)
+    if limit and total > limit:
+        err(f"warning: showing {limit} of {total} matching transactions (use --limit to increase)")
     result = [fmt.format_short(tx, tx["id"] in pending_ids) for tx in filtered]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
