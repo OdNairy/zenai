@@ -144,8 +144,11 @@ class Lookup:
         for t in self.raw.get("tag", []):
             self.tags_by_id[t["id"]] = t
             self.tags_by_name[t["title"].lower()] = t
+        self._eur_rate = 1.0
         for i in self.raw.get("instrument", []):
             self.instruments_by_id[i["id"]] = i
+            if i.get("shortTitle") == "EUR" and i.get("rate"):
+                self._eur_rate = i["rate"]
         for m in self.raw.get("merchant", []):
             self.merchants_by_id[m["id"]] = m
 
@@ -174,14 +177,18 @@ class Lookup:
         return inst["shortTitle"] if inst else "?"
 
     def to_eur(self, amount, account_id):
-        """Convert amount from account's currency to EUR using instrument.rate."""
+        """Convert amount from account's currency to EUR.
+
+        ZenMoney stores rates as: rate = N units of base currency per 1 unit of instrument.
+        To convert to EUR: amount * (instrument.rate / eur.rate)
+        """
         a = self.accounts_by_id.get(account_id)
         if not a:
             return None
         inst = self.instruments_by_id.get(a.get("instrument"))
         if not inst or not inst.get("rate"):
             return None
-        return round(amount / inst["rate"], 2)
+        return round(amount * inst["rate"] / self._eur_rate, 2)
 
     def merchant_name(self, mid):
         if not mid:
