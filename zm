@@ -9,7 +9,7 @@ import time
 import uuid
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -362,6 +362,36 @@ def apply_pending_overlay(raw, pending):
 # Filter helpers
 # ---------------------------------------------------------------------------
 
+def resolve_date_range(args):
+    """Resolve --last shortcut into from_date/to_date on args. Mutates args in-place."""
+    period = getattr(args, 'last', None)
+    if not period:
+        return
+    if getattr(args, 'from_date', None) or getattr(args, 'to_date', None):
+        die("cannot use --last together with --from/--to")
+    today = date.today()
+    if period == "ytd":
+        args.from_date = f"{today.year}-01-01"
+        args.to_date = (today - timedelta(days=1)).isoformat()
+    elif period.endswith("m"):
+        n = int(period[:-1])
+        end = today.replace(day=1) - timedelta(days=1)
+        start_month = today.month - n
+        start_year = today.year
+        while start_month <= 0:
+            start_month += 12
+            start_year -= 1
+        args.from_date = date(start_year, start_month, 1).isoformat()
+        args.to_date = end.isoformat()
+    elif period.endswith("y"):
+        n = int(period[:-1])
+        year = today.year - n
+        args.from_date = f"{year}-01-01"
+        args.to_date = f"{year}-12-31"
+    else:
+        die(f"unknown period format: {period}")
+
+
 def filter_transactions(txs, args, pending_ids=None):
     results = []
     for tx in txs:
@@ -481,6 +511,7 @@ def cmd_list(args, store):
     lookup_global = lk
     fmt = Formatter(lk)
 
+    resolve_date_range(args)
     filtered, total = filter_transactions(txs, args, pending_ids)
     limit = getattr(args, 'limit', None)
     if limit and total > limit:
@@ -1397,6 +1428,7 @@ def build_parser():
     p = sub.add_parser("list", help="List transactions")
     p.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD)")
     p.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD)")
+    p.add_argument("--last", help="Date shortcut: Nm (last N full months), Ny (last N full years), ytd (year-to-date)")
     p.add_argument("--payee", help="Filter by payee (substring match)")
     p.add_argument("--tag", dest="tag_filter", help="Filter by tag name")
     p.add_argument("--account", help="Filter by account name")
