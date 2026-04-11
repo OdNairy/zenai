@@ -173,6 +173,16 @@ class Lookup:
         inst = self.instruments_by_id.get(iid)
         return inst["shortTitle"] if inst else "?"
 
+    def to_eur(self, amount, account_id):
+        """Convert amount from account's currency to EUR using instrument.rate."""
+        a = self.accounts_by_id.get(account_id)
+        if not a:
+            return None
+        inst = self.instruments_by_id.get(a.get("instrument"))
+        if not inst or not inst.get("rate"):
+            return None
+        return round(amount / inst["rate"], 2)
+
     def merchant_name(self, mid):
         if not mid:
             return None
@@ -239,6 +249,17 @@ class Formatter:
         cur = self.lk.account_currency(tx.get("outcomeAccount", ""))
         return f"-{tx.get('outcome', 0):.2f} {cur}"
 
+    def _amount_eur(self, tx):
+        ttype = self.tx_type(tx)
+        if ttype == "expense":
+            v = self.lk.to_eur(tx.get("outcome", 0), tx.get("outcomeAccount"))
+            return -v if v is not None else None
+        if ttype == "income":
+            return self.lk.to_eur(tx.get("income", 0), tx.get("incomeAccount"))
+        # transfer: convert outcome side
+        v = self.lk.to_eur(tx.get("outcome", 0), tx.get("outcomeAccount"))
+        return -v if v is not None else None
+
     def format_short(self, tx, is_pending=False):
         ttype = self.tx_type(tx)
         obj = {
@@ -246,6 +267,7 @@ class Formatter:
             "date": tx.get("date", ""),
             "type": ttype,
             "amount": self.format_amount(tx),
+            "amountEur": self._amount_eur(tx),
         }
         if ttype == "transfer":
             obj["from"] = self.lk.account_name(tx.get("outcomeAccount", ""))

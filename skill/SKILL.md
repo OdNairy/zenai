@@ -112,6 +112,14 @@ zm tags                # list tags/categories with IDs
 | `review` | Suggest tags based on history (optionally AI-powered) |
 | `push` | Push pending changes to API |
 
+## Output fields
+
+`zm list` and `zm show` output includes:
+- `amount` — human-readable string with original currency (e.g. `-4000.00 RUB`, `+94.33 EUR`)
+- `amountEur` — numeric EUR equivalent, ready for aggregation (e.g. `-40.00`, `-94.33`)
+
+**For aggregation always use `amountEur`**, not `amount`. Parsing the `amount` string and summing across currencies gives wrong results (e.g. 4000 RUB would be treated as 4000 EUR).
+
 ## Behavior guidelines
 
 - Always show `zm list` output before making changes so the user can confirm the right transaction
