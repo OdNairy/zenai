@@ -145,10 +145,12 @@ class Lookup:
             self.tags_by_id[t["id"]] = t
             self.tags_by_name[t["title"].lower()] = t
         self._eur_rate = 1.0
+        self._eur_instrument_id = None
         for i in self.raw.get("instrument", []):
             self.instruments_by_id[i["id"]] = i
             if i.get("shortTitle") == "EUR" and i.get("rate"):
                 self._eur_rate = i["rate"]
+                self._eur_instrument_id = i["id"]
         for m in self.raw.get("merchant", []):
             self.merchants_by_id[m["id"]] = m
 
@@ -176,6 +178,11 @@ class Lookup:
         inst = self.instruments_by_id.get(iid)
         return inst["shortTitle"] if inst else "?"
 
+    # Currencies considered "strong" for EUR conversion purposes.
+    # When a transaction's operation currency is in this set, use the op amount
+    # for conversion rather than the (potentially weak) account currency.
+    STRONG_CURRENCIES = {"EUR", "USD", "GBP", "CHF", "SEK", "NOK", "DKK", "CAD", "AUD", "JPY", "CZK"}
+
     def to_eur(self, amount, account_id):
         """Convert amount from account's currency to EUR.
 
@@ -186,6 +193,13 @@ class Lookup:
         if not a:
             return None
         inst = self.instruments_by_id.get(a.get("instrument"))
+        if not inst or not inst.get("rate"):
+            return None
+        return round(amount * inst["rate"] / self._eur_rate, 2)
+
+    def instrument_to_eur(self, amount, instrument_id):
+        """Convert amount in a given instrument directly to EUR."""
+        inst = self.instruments_by_id.get(instrument_id)
         if not inst or not inst.get("rate"):
             return None
         return round(amount * inst["rate"] / self._eur_rate, 2)
@@ -256,14 +270,38 @@ class Formatter:
         cur = self.lk.account_currency(tx.get("outcomeAccount", ""))
         return f"-{tx.get('outcome', 0):.2f} {cur}"
 
+    def _op_to_eur(self, op_amount, op_instrument_id):
+        """If op currency is strong, convert op amount to EUR. Returns None if weak."""
+        sym = self.lk.instrument_symbol(op_instrument_id)
+        if sym not in self.lk.STRONG_CURRENCIES:
+            return None
+        if op_instrument_id == self.lk._eur_instrument_id:
+            return round(op_amount, 2)
+        return self.lk.instrument_to_eur(op_amount, op_instrument_id)
+
     def _amount_eur(self, tx):
         ttype = self.tx_type(tx)
         if ttype == "expense":
+            op_iid = tx.get("opOutcomeInstrument")
+            if op_iid:
+                v = self._op_to_eur(tx.get("opOutcome", 0), op_iid)
+                if v is not None:
+                    return -v
             v = self.lk.to_eur(tx.get("outcome", 0), tx.get("outcomeAccount"))
             return -v if v is not None else None
         if ttype == "income":
+            op_iid = tx.get("opIncomeInstrument")
+            if op_iid:
+                v = self._op_to_eur(tx.get("opIncome", 0), op_iid)
+                if v is not None:
+                    return v
             return self.lk.to_eur(tx.get("income", 0), tx.get("incomeAccount"))
-        # transfer: convert outcome side
+        # transfer: use outcome side
+        op_iid = tx.get("opOutcomeInstrument")
+        if op_iid:
+            v = self._op_to_eur(tx.get("opOutcome", 0), op_iid)
+            if v is not None:
+                return -v
         v = self.lk.to_eur(tx.get("outcome", 0), tx.get("outcomeAccount"))
         return -v if v is not None else None
 
