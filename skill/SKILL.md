@@ -22,17 +22,24 @@ Personal finance management tool that talks to the ZenMoney API.
 ```bash
 zm list --limit 20
 zm list --from 2026-01-01 --to 2026-03-31
+zm list --last 12m           # last 12 full months
+zm list --last 6m            # last 6 full months
+zm list --last 1y            # last full calendar year
+zm list --last ytd           # year-to-date
 zm list --payee Prisma
 zm list --untagged --type expense
 zm list --tag "Продукты" --account "Revolut EUR Joint"
 zm list --min 100 --max 500
+zm list --in-balance         # only transactions from inBalance accounts
 zm show <id-prefix>          # full details of one or more transactions
 ```
 
 ### Tag / categorize
 ```bash
 zm tag-set <id> --tags "Продукты"          # replace all tags
-zm tag-add <id> --tags "Кафе"              # add tag
+zm tag-add <id> --tags "Кафе"              # add tag (appended → project role)
+zm tag-add <id> --tags "Продукты" --as-category  # insert at front → category role
+zm tag-add <id> --tags "Турция" --as-project     # append at end → project role
 zm tag-remove <id> --tags "Продукты"       # remove tag
 zm review --from 2026-02-01                # history-based suggestions
 zm review --from 2026-02-01 --ai           # + AI for unknown payees
@@ -83,7 +90,7 @@ zm sync --full         # full re-fetch
 
 ### Reference data
 ```bash
-zm accounts            # list accounts with IDs
+zm accounts            # list accounts with IDs and inBalance status
 zm tags                # list tags/categories with IDs
 ```
 
@@ -117,8 +124,17 @@ zm tags                # list tags/categories with IDs
 `zm list` and `zm show` output includes:
 - `amount` — human-readable string with original currency (e.g. `-4000.00 RUB`, `+94.33 EUR`)
 - `amountEur` — numeric EUR equivalent, ready for aggregation (e.g. `-40.00`, `-94.33`)
+- `category` — first tag (category role); `"(без категории)"` if no tags
+- `project` — last tag (project role); `null` if 0–1 tags
+- `tags` — full tag list (all tags including middle ones for 3+)
 
 **For aggregation always use `amountEur`**, not `amount`. Parsing the `amount` string and summing across currencies gives wrong results (e.g. 4000 RUB would be treated as 4000 EUR).
+
+**Tag roles:** first tag = category, last tag = project. Use `category`/`project` for grouping in reports to avoid double-counting. Use `--as-category` / `--as-project` with `tag-add` to control insertion position.
+
+**`--in-balance` filter:** restricts results to transactions from accounts with `inBalance=True` (checks `outcomeAccount` for expenses, `incomeAccount` for income). Includes archived accounts. Use for "real money" reporting.
+
+**`--last` shortcut:** `--last 12m` = last 12 full months, `--last 1y` = last full calendar year, `--last ytd` = year-to-date. Mutually exclusive with `--from`/`--to`.
 
 ## Behavior guidelines
 
