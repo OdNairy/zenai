@@ -1,4 +1,4 @@
-# zerro-ai-control
+# zenai
 
 CLI-инструмент для управления транзакциями [ZenMoney](https://zenmoney.ru) через API. Один файл на Python, без внешних зависимостей.
 
@@ -8,8 +8,8 @@ CLI-инструмент для управления транзакциями [Z
 
 ```bash
 # Клонировать
-git clone git@github.com:OdNairy/zerro-ai-control.git
-cd zerro-ai-control
+git clone git@github.com:OdNairy/zenai.git
+cd zenai
 
 # Положить API-токен ZenMoney
 mkdir -p data
