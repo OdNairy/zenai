@@ -1599,6 +1599,12 @@ def cmd_push(args, store):
         originals = {x["id"]: x for x in raw.get(entity, [])}
         base = dict(originals.get(eid, {"id": eid}))
         base.update(changes["new"])
+        if entity == "transaction":
+            # API rejects transactions missing any of these (e.g. from `zm create`)
+            for field in ("reminderMarker", "qrCode", "latitude", "longitude",
+                          "incomeBankID", "outcomeBankID"):
+                base.setdefault(field, None)
+            base.setdefault("viewed", False)
         base["changed"] = int(time.time())
         diff_payload.setdefault(entity, []).append(base)
 
